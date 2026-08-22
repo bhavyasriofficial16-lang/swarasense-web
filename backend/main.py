@@ -131,22 +131,33 @@ async def client_audio_stream(websocket: WebSocket):
             if samples.size == 0:
                 continue
 
-            frequency, confidence = detect_pitch(samples, sample_rate)
-            if frequency is None or confidence < CONFIDENCE_THRESHOLD:
-                continue
+            # Everything from here on touches floating-point math (log2 in
+            # the mapper, division in pitch detection) that could in theory
+            # throw on a pathological chunk (e.g. all-NaN audio from a
+            # brief mic glitch). Without this guard, one bad chunk would
+            # crash the whole connection handler -- the socket closes, and
+            # while the frontend does auto-reconnect, it's a jarring gap in
+            # a live demo. Better to log and skip just that one chunk.
+            try:
+                frequency, confidence = detect_pitch(samples, sample_rate)
+                if frequency is None or confidence < CONFIDENCE_THRESHOLD:
+                    continue
 
-            if calibrate_requested:
-                mapper.set_sa(frequency)
-                await websocket.send_text(json.dumps({
-                    "type": "calibration_result",
-                    "sa_frequency": round(mapper.sa_frequency, 2),
-                }))
-                continue
+                if calibrate_requested:
+                    mapper.set_sa(frequency)
+                    await websocket.send_text(json.dumps({
+                        "type": "calibration_result",
+                        "sa_frequency": round(mapper.sa_frequency, 2),
+                    }))
+                    continue
 
-            result = mapper.classify(frequency, confidence)
-            if result:
-                result["type"] = "detection"
-                await websocket.send_text(json.dumps(result))
+                result = mapper.classify(frequency, confidence)
+                if result:
+                    result["type"] = "detection"
+                    await websocket.send_text(json.dumps(result))
+            except Exception as exc:
+                print(f"Skipping bad audio chunk: {exc}")
+                continue
 
     except WebSocketDisconnect:
         pass

@@ -10,6 +10,22 @@ const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
 const MAX_HISTORY = 12;
 const RECONNECT_DELAY_MS = 2000;
 
+// If the socket reports "open" but hasn't delivered anything in this long,
+// treat it as stale and force a reconnect. This is what actually fixes the
+// "swara freezes but everything looks otherwise fine" symptom -- a
+// WebSocket can silently stop delivering data (free-tier hosting proxy
+// idle timeouts, a flaky mobile network swapping towers, etc.) without
+// ever firing onclose/onerror, so relying on those alone isn't enough for
+// a long-running session.
+const STALE_TIMEOUT_MS = 10000;
+const STALE_CHECK_INTERVAL_MS = 3000;
+
+// If the browser can't push data to the server fast enough, `bufferedAmount`
+// grows. Skipping sends while it's backed up prevents that queue from
+// growing unbounded over a long session, which would otherwise eventually
+// degrade or stall the connection.
+const MAX_BUFFERED_BYTES = 256 * 1024;
+
 export function useSwaraSocket() {
   const [current, setCurrent] = useState(null);
   const [history, setHistory] = useState([]);
@@ -17,6 +33,8 @@ export function useSwaraSocket() {
   const [saFrequency, setSaFrequency] = useState(null);
   const socketRef = useRef(null);
   const reconnectTimer = useRef(null);
+  const staleCheckTimer = useRef(null);
+  const lastMessageAtRef = useRef(Date.now());
   const calibrateArmedRef = useRef(false);
   const calibrateResolveRef = useRef(null);
 
@@ -24,8 +42,13 @@ export function useSwaraSocket() {
     setStatus("connecting");
     const socket = new WebSocket(WS_URL);
     socketRef.current = socket;
+    lastMessageAtRef.current = Date.now();
 
-    socket.onopen = () => setStatus("connected");
+    socket.onopen = () => {
+      setStatus("connected");
+      lastMessageAtRef.current = Date.now();
+    };
+
     socket.onerror = () => setStatus("error");
 
     socket.onclose = () => {
@@ -34,6 +57,7 @@ export function useSwaraSocket() {
     };
 
     socket.onmessage = (event) => {
+      lastMessageAtRef.current = Date.now();
       try {
         const data = JSON.parse(event.data);
 
@@ -54,19 +78,37 @@ export function useSwaraSocket() {
 
   useEffect(() => {
     connect();
+
+    // Periodically check whether the socket has gone quiet despite still
+    // reporting itself "open" -- if so, force-close it (triggering onclose
+    // -> the existing auto-reconnect logic) rather than waiting indefinitely.
+    staleCheckTimer.current = setInterval(() => {
+      const socket = socketRef.current;
+      if (
+        socket &&
+        socket.readyState === WebSocket.OPEN &&
+        Date.now() - lastMessageAtRef.current > STALE_TIMEOUT_MS
+      ) {
+        console.warn("WebSocket appears stale (no data in a while) -- reconnecting.");
+        socket.close();
+      }
+    }, STALE_CHECK_INTERVAL_MS);
+
     return () => {
       clearTimeout(reconnectTimer.current);
+      clearInterval(staleCheckTimer.current);
       socketRef.current?.close();
     };
   }, [connect]);
 
   const sendAudioChunk = useCallback((base64Pcm, sampleRate) => {
     const socket = socketRef.current;
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      const calibrate = calibrateArmedRef.current;
-      if (calibrate) calibrateArmedRef.current = false;
-      socket.send(JSON.stringify({ audio: base64Pcm, sampleRate, calibrate }));
-    }
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    if (socket.bufferedAmount > MAX_BUFFERED_BYTES) return; // let it catch up
+
+    const calibrate = calibrateArmedRef.current;
+    if (calibrate) calibrateArmedRef.current = false;
+    socket.send(JSON.stringify({ audio: base64Pcm, sampleRate, calibrate }));
   }, []);
 
   const calibrateSaFromMic = useCallback(() => {
